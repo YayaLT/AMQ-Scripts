@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         AMQ Custom List Exporter
 // @namespace    https://github.com/YayaLT/AMQ-Scripts
-// @version      1.3
-// @description  Adds an export button to each custom list in the AMQ song library. Fetches song metadata (HQ/MQ/audio links) from anisongdb and exports as a flat JSON array.
+// @version      1.4
+// @description  Adds an export button to each custom lisst in the AMQ song library. Fetches song metadata (HQ/MQ/audio links) from anisongdb and exports as a flat JSON array.
 // @author       YayaLT
 // @match        https://*.animemusicquiz.com/*
-// @icon         https://animemusicquiz.com/favicon.ico
+// @icon         https://animemusicsquiz.com/favicon.ico
 // @downloadURL  https://github.com/YayaLT/AMQ-Scripts/raw/main/amqCustomListExporter.user.js
 // @updateURL    https://github.com/YayaLT/AMQ-Scripts/raw/main/amqCustomListExporter.user.js
 // @grant        none
@@ -85,7 +85,7 @@
     // ─── Export ──────────────────────────────────────────────────────────────────
 
     // Construit une entrée de fallback depuis libraryCacheHandler
-    // pour les songs absentes d'anisongdb
+    // pour les songs absentes d'anisongdb ou avec des données incomplètes
     function buildFallbackEntry(annSongId) {
         const animeId   = libraryCacheHandler.annSongIdAnnIdMap[annSongId];
         const songEntry = libraryCacheHandler.songEntryMap[annSongId];
@@ -112,6 +112,11 @@
         };
     }
 
+    // Une entrée anisongdb est valide si elle a au moins songName et un lien audio
+    function isValidEntry(entry) {
+        return entry && (entry.songName || entry.HQ || entry.MQ || entry.audio);
+    }
+
     async function exportList(list, btn) {
         btn.classList.add('elCustomListExportLoading');
         btn.querySelector('i').className = 'fa fa-spinner fa-spin';
@@ -121,16 +126,19 @@
         // Étape 1 : requête principale via ann_song_ids_request
         const annMap = await fetchByAnnSongIds(annSongIds);
 
-        // Étape 2 : fallback via amq_song_ids_request pour les IDs manquants
-        const missingIds = annSongIds.filter(id => !annMap[id]);
+        // Étape 2 : fallback via amq_song_ids_request pour les IDs manquants ou invalides
+        const missingIds = annSongIds.filter(id => !isValidEntry(annMap[id]));
         const amqMap     = missingIds.length > 0
             ? await fetchByAmqSongIds(missingIds)
             : {};
 
         // Tableau plat dans l'ordre de la liste
-        const songs = annSongIds.map(annSongId =>
-            annMap[annSongId] ?? amqMap[annSongId] ?? buildFallbackEntry(annSongId)
-        );
+        // Priorité : ann -> amq -> fallback libraryCacheHandler
+        const songs = annSongIds.map(annSongId => {
+            if (isValidEntry(annMap[annSongId]))  return annMap[annSongId];
+            if (isValidEntry(amqMap[annSongId]))  return amqMap[annSongId];
+            return buildFallbackEntry(annSongId);
+        });
 
         const blob = new Blob([JSON.stringify(songs, null, 2)], { type: 'application/json' });
         const url  = URL.createObjectURL(blob);
