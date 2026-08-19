@@ -7,6 +7,8 @@
 // @match        https://*.animemusicquiz.com/*
 // @icon         https://animemusicquiz.com/favicon.ico
 // @grant        none
+// @downloadURL  https://github.com/YayaLT/AMQ-Scripts/raw/main/amqCustomListExporter.user.js
+// @updateURL    https://github.com/YayaLT/AMQ-Scripts/raw/main/amqCustomListExporter.user.js
 // ==/UserScript==
 
 (function () {
