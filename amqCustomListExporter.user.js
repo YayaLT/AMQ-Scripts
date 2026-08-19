@@ -1,25 +1,22 @@
 // ==UserScript==
 // @name         AMQ Custom List Exporter
 // @namespace    https://github.com/YayaLT/AMQ-Scripts
-// @version      1.4
-// @description  Adds an export button to each custom lisst in the AMQ song library. Fetches song metadata (HQ/MQ/audio links) from anisongdb and exports as a flat JSON array.
+// @version      1.5
+// @description  Adds an export button to each custom list in the AMQ song library. Fetches song metadata from anisongdb (with text search fallback & rate-limit) and exports as JSON.
 // @author       YayaLT
 // @match        https://*.animemusicquiz.com/*
-// @icon         https://animemusicsquiz.com/favicon.ico
-// @downloadURL  https://github.com/YayaLT/AMQ-Scripts/raw/main/amqCustomListExporter.user.js
-// @updateURL    https://github.com/YayaLT/AMQ-Scripts/raw/main/amqCustomListExporter.user.js
+// @icon         https://animemusicquiz.com/favicon.ico
 // @grant        none
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    // Nombre de songs envoyées par requête à anisongdb (max recommandé : 50)
     const ANISONGDB_BATCH_SIZE = 50;
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
     // ─── Initialisation ──────────────────────────────────────────────────────────
 
-    // Attend que les objets globaux AMQ soient prêts avant d'injecter les boutons
     function waitForAMQ(callback) {
         const interval = setInterval(() => {
             if (typeof customListHandler !== 'undefined'
@@ -35,8 +32,6 @@
 
     // ─── anisongdb ───────────────────────────────────────────────────────────────
 
-    // Requête ann_song_ids_request — couvre la majorité des cas
-    // Retourne un dict { annSongId -> songObject }
     async function fetchByAnnSongIds(annSongIds) {
         const results = {};
         for (let i = 0; i < annSongIds.length; i += ANISONGDB_BATCH_SIZE) {
@@ -54,13 +49,11 @@
             } catch (e) {
                 console.error('[AMQ Exporter] ann_song_ids batch error:', e);
             }
+            await sleep(300); // Pause anti-surcharge (503)
         }
         return results;
     }
 
-    // Requête amq_song_ids_request — fallback pour les IDs non trouvés par ann_song_ids_request
-    // Dans anisongdb, amqSongId == annSongId AMQ pour certaines chansons
-    // Retourne un dict { amqSongId -> songObject }
     async function fetchByAmqSongIds(annSongIds) {
         const results = {};
         for (let i = 0; i < annSongIds.length; i += ANISONGDB_BATCH_SIZE) {
@@ -78,15 +71,46 @@
             } catch (e) {
                 console.error('[AMQ Exporter] amq_song_ids batch error:', e);
             }
+            await sleep(300); // Pause anti-surcharge (503)
         }
         return results;
     }
 
+    // Fallback : recherche textuelle par Nom + Artiste
+    async function fetchByTextSearch(songName, songArtist) {
+        if (!songName) return null;
+        try {
+            const payload = {
+                song_name_search_filter: { search: songName, partial_match: false },
+                and_logic: true,
+                ignore_duplicate: false
+            };
+            if (songArtist) {
+                payload.artist_search_filter = { search: songArtist, partial_match: false };
+            }
+
+            const response = await fetch('https://anisongdb.com/api/search_request', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                if (Array.isArray(data) && data.length > 0) {
+                    // Priorité au résultat qui contient HQ ou MQ
+                    return data.find(item => item.HQ || item.MQ) || data[0];
+                }
+            }
+        } catch (e) {
+            console.error('[AMQ Exporter] text search error:', e);
+        }
+        return null;
+    }
+
     // ─── Export ──────────────────────────────────────────────────────────────────
 
-    // Construit une entrée de fallback depuis libraryCacheHandler
-    // pour les songs absentes d'anisongdb ou avec des données incomplètes
-    function buildFallbackEntry(annSongId) {
+    function getAMQMetadata(annSongId) {
         const animeId   = libraryCacheHandler.annSongIdAnnIdMap[annSongId];
         const songEntry = libraryCacheHandler.songEntryMap[annSongId];
         const songMeta  = animeId != null
@@ -101,8 +125,8 @@
 
         return {
             annSongId,
-            songName:    songEntry?.name         ?? null,
-            songArtist:  songEntry?.artist?.name ?? null,
+            songName:    songEntry?.name        ?? songMeta?.name   ?? null,
+            songArtist:  songEntry?.artist?.name ?? songMeta?.artist ?? null,
             songType,
             animeENName: anime?.mainNames?.EN    ?? null,
             animeJPName: anime?.mainNames?.JA    ?? null,
@@ -112,7 +136,10 @@
         };
     }
 
-    // Une entrée anisongdb est valide si elle a au moins songName et un lien audio
+    function hasVideoLink(entry) {
+        return entry && (entry.HQ || entry.MQ);
+    }
+
     function isValidEntry(entry) {
         return entry && (entry.songName || entry.HQ || entry.MQ || entry.audio);
     }
@@ -123,23 +150,40 @@
 
         const annSongIds = [...list.songMap.keys()];
 
-        // Étape 1 : requête principale via ann_song_ids_request
+        // Étape 1 : Requête par ANN ID (avec rate-limiting)
         const annMap = await fetchByAnnSongIds(annSongIds);
 
-        // Étape 2 : fallback via amq_song_ids_request pour les IDs manquants ou invalides
-        const missingIds = annSongIds.filter(id => !isValidEntry(annMap[id]));
-        const amqMap     = missingIds.length > 0
-            ? await fetchByAmqSongIds(missingIds)
+        // Étape 2 : Requête par AMQ ID pour ce qui n'a pas de vidéo
+        const missingVideoIds = annSongIds.filter(id => !hasVideoLink(annMap[id]));
+        const amqMap = missingVideoIds.length > 0
+            ? await fetchByAmqSongIds(missingVideoIds)
             : {};
 
-        // Tableau plat dans l'ordre de la liste
-        // Priorité : ann -> amq -> fallback libraryCacheHandler
-        const songs = annSongIds.map(annSongId => {
-            if (isValidEntry(annMap[annSongId]))  return annMap[annSongId];
-            if (isValidEntry(amqMap[annSongId]))  return amqMap[annSongId];
-            return buildFallbackEntry(annSongId);
-        });
+        // Étape 3 : Traitement chanson par chanson avec fallback textuel si besoin
+        const songs = [];
+        for (const annSongId of annSongIds) {
+            let entry = annMap[annSongId];
 
+            if (!hasVideoLink(entry) && isValidEntry(amqMap[annSongId])) {
+                entry = amqMap[annSongId];
+            }
+
+            // Si toujours pas de vidéo, lancer la recherche par Titre/Artiste
+            if (!hasVideoLink(entry)) {
+                const localMeta = getAMQMetadata(annSongId);
+                const searchResult = await fetchByTextSearch(localMeta.songName, localMeta.songArtist);
+
+                if (hasVideoLink(searchResult)) {
+                    entry = searchResult;
+                } else if (!isValidEntry(entry)) {
+                    entry = searchResult || localMeta;
+                }
+            }
+
+            songs.push(entry);
+        }
+
+        // Génération du fichier JSON
         const blob = new Blob([JSON.stringify(songs, null, 2)], { type: 'application/json' });
         const url  = URL.createObjectURL(blob);
         const a    = document.createElement('a');
@@ -156,7 +200,6 @@
 
     // ─── UI ──────────────────────────────────────────────────────────────────────
 
-    // Injecte un bouton download dans le container d'options d'une liste
     function injectExportButton(list) {
         const $optionContainer = list.$entry.find('.elCustomListEntryOptionContainer');
         if ($optionContainer.find('.elCustomListExportButton').length > 0) return;
@@ -179,7 +222,6 @@
         customListHandler.customListMap.forEach((list) => injectExportButton(list));
     }
 
-    // Observe les nouvelles listes créées dynamiquement
     function observeNewLists() {
         const container = document.getElementById('elCustomListEntryContainer');
         if (!container) return;
